@@ -47,6 +47,9 @@ class ImageDatasetParams(BaseDatasetParams):
     image_directory: Optional[str] = None
     image_jsonl_file: Optional[str] = None
     control_directory: Optional[str] = None
+    mask_directory: Optional[str] = None
+    alpha_mask: bool = False
+    require_mask: bool = False
     multiple_target: Optional[bool] = False
 
     # FramePack dependent parameters
@@ -64,6 +67,7 @@ class VideoDatasetParams(BaseDatasetParams):
     video_directory: Optional[str] = None
     video_jsonl_file: Optional[str] = None
     control_directory: Optional[str] = None
+    mask_directory: Optional[str] = None
     target_frames: Sequence[int] = (1,)
     frame_extraction: Optional[str] = "head"
     frame_stride: Optional[int] = 1
@@ -122,6 +126,9 @@ class ConfigSanitizer:
         "image_jsonl_file": str,
         "cache_directory": str,
         "control_directory": str,
+        "mask_directory": str,
+        "alpha_mask": bool,
+        "require_mask": bool,
         "multiple_target": bool,
         "fp_latent_window_size": int,
         "fp_1f_clean_indices": [int],
@@ -134,6 +141,7 @@ class ConfigSanitizer:
         "video_directory": str,
         "video_jsonl_file": str,
         "control_directory": str,
+        "mask_directory": str,
         "target_frames": [int],
         "frame_extraction": str,
         "frame_stride": int,
@@ -317,6 +325,9 @@ def generate_dataset_group_by_blueprint(
         image_directory: "{dataset.image_directory}"
         image_jsonl_file: "{dataset.image_jsonl_file}"
         control_directory: "{dataset.control_directory}"
+        mask_directory: "{dataset.mask_directory}"
+        alpha_mask: {dataset.alpha_mask}
+        require_mask: {dataset.require_mask}
         multiple_target: {dataset.multiple_target}
         fp_latent_window_size: {dataset.fp_latent_window_size}
         fp_1f_clean_indices: {dataset.fp_1f_clean_indices}

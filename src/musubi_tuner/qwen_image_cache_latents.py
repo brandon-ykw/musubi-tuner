@@ -4,6 +4,7 @@ from typing import List
 
 import numpy as np
 import torch
+import torch.nn.functional as Fnn
 
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
@@ -122,12 +123,57 @@ def encode_and_save_batch(vae: qwen_image_autoencoder_kl.AutoencoderKLQwenImage,
     for b, item in enumerate(batch):
         target_latent = latents[b]  # C, L, H, W. Target latents for this image (ground truth)
         control_latent = control_latents[b] if control_latents is not None else None  # list of (C, 1, H, W) or None
-        print(
-            f"Saving cache for item {item.item_key} at {item.latent_cache_path}, target latents shape: {target_latent.shape}, "
-            f"control latents shape: {[cl.shape for cl in control_latent] if control_latent is not None else None}"
+
+        # Process mask if available (for mask-weighted loss training)
+        mask_weights_i = None
+        if item.mask_content is not None:
+            mask_np = item.mask_content  # (H, W) grayscale 0-255
+
+            if mask_np.sum() == 0:
+                logger.warning(
+                    f"All-zero mask for '{item.item_key}' — this item will contribute zero training signal."
+                )
+
+            # Validate aspect ratio matching
+            mask_h, mask_w = mask_np.shape[:2]
+            img_h = target_latent.shape[2] * qwen_image_utils.VAE_SCALE_FACTOR
+            img_w = target_latent.shape[3] * qwen_image_utils.VAE_SCALE_FACTOR
+            if img_h > 0 and img_w > 0 and mask_h > 0 and mask_w > 0:
+                img_ar = img_w / img_h
+                mask_ar = mask_w / mask_h
+                if abs(img_ar - mask_ar) / max(img_ar, mask_ar) > 0.10:
+                    logger.warning(
+                        f"Mask aspect ratio ({mask_w}x{mask_h}, AR={mask_ar:.2f}) differs >10% from target "
+                        f"({img_w}x{img_h}, AR={img_ar:.2f}) for '{item.item_key}'."
+                    )
+
+            mask = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+            mask = (mask.float() / 255.0).clamp_(0.0, 1.0)
+            mask = cache_latents.apply_cache_mask_transforms(
+                mask,
+                cache_mask_gamma=float(getattr(item, "cache_mask_gamma", 1.0) or 1.0),
+                cache_mask_min_weight=float(getattr(item, "cache_mask_min_weight", 0.0) or 0.0),
+            )
+
+            # Downsample to latent space using area interpolation
+            _, lat_l, lat_h, lat_w = target_latent.shape
+            mask = Fnn.interpolate(mask, size=(lat_h, lat_w), mode="area")  # (1, 1, lat_h, lat_w)
+            mask = mask.expand(-1, lat_l, -1, -1)  # (1, lat_l, lat_h, lat_w)
+            mask_weights_i = mask
+
+        logger.info(
+            f"Saving cache for item {item.item_key} at {item.latent_cache_path}, "
+            f"target latents shape: {target_latent.shape}, "
+            f"control latents shape: {[cl.shape for cl in control_latent] if control_latent is not None else None}, "
+            f"mask weights shape: {mask_weights_i.shape if mask_weights_i is not None else None}"
         )
 
-        save_latent_cache_qwen_image(item_info=item, latent=target_latent, control_latent=control_latent)
+        save_latent_cache_qwen_image(
+            item_info=item,
+            latent=target_latent,
+            control_latent=control_latent,
+            mask_weights=mask_weights_i,
+        )
 
 
 def qwen_image_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:

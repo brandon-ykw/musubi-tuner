@@ -1,5 +1,6 @@
 import ast
 import asyncio
+from contextlib import contextmanager
 from datetime import timedelta
 import gc
 import importlib
@@ -40,7 +41,17 @@ from musubi_tuner.hunyuan_model.models import load_transformer, get_rotary_pos_e
 import musubi_tuner.hunyuan_model.text_encoder as text_encoder_module
 from musubi_tuner.hunyuan_model.vae import load_vae, VAE_VER
 import musubi_tuner.hunyuan_model.vae as vae_module
+from musubi_tuner.modules.loss_utils import compute_unreduced_target_loss
+from musubi_tuner.modules.lora_ema_teacher import LoRAEmaTeacher
 from musubi_tuner.modules.lr_schedulers import RexLR
+from musubi_tuner.modules.mask_loss import (
+    add_mask_loss_args,
+    apply_masked_loss_with_prior,
+    log_mask_loss_banner,
+    require_mask_weights_if_enabled,
+    validate_mask_loss_args as validate_mask_loss_args_impl,
+)
+from musubi_tuner.modules.prior_scheduling import compute_prior_weight_per_sample
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 import musubi_tuner.networks.lora as lora_module
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
@@ -358,6 +369,10 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, noise_scheduler, times
     return weighting
 
 
+def validate_mask_loss_args(args: argparse.Namespace) -> None:
+    validate_mask_loss_args_impl(args)
+
+
 def should_sample_images(args, steps, epoch=None):
     if steps == 0:
         if not args.sample_at_first:
@@ -430,6 +445,38 @@ class NetworkTrainer:
                     logs[f"lr/d*eff_lr/{lr_desc}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["effective_lr"]
 
         return logs
+
+    @contextmanager
+    def prior_model_context(self, network):
+        """
+        Context manager to temporarily disable LoRA for computing prior predictions.
+        Keeps model in train() mode during teacher forward (DiT models have no dropout).
+        """
+        if network is None:
+            yield
+            return
+
+        if hasattr(network, "set_enabled"):
+            try:
+                network.set_enabled(False)
+                yield
+            finally:
+                network.set_enabled(True)
+            return
+
+        if hasattr(network, "set_multiplier"):
+            prev_multiplier = getattr(network, "multiplier", None)
+            try:
+                network.set_multiplier(0)
+                yield
+            finally:
+                network.set_multiplier(1.0 if prev_multiplier is None else prev_multiplier)
+            return
+
+        raise ValueError(
+            "Prior preservation requires the network module to support temporarily disabling adapters via "
+            "`set_enabled(False)` or `set_multiplier(0)`, but neither method exists on this network object."
+        )
 
     def get_optimizer(self, args, trainable_params: list[torch.nn.Parameter]) -> tuple[str, str, torch.optim.Optimizer]:
         # adamw, adamw8bit, adafactor
@@ -1671,6 +1718,7 @@ class NetworkTrainer:
 
         # check model specific arguments
         self.handle_model_specific_args(args)
+        validate_mask_loss_args(args)
 
         # show timesteps for debugging
         if args.show_timesteps:
@@ -2167,9 +2215,34 @@ class NetworkTrainer:
             f"DiT dtype: {first_param.dtype if first_param is not None else None}, device: {first_param.device if first_param is not None else accelerator.device}"
         )
 
+        log_mask_loss_banner(
+            logger,
+            args,
+            cache_hint="If you see 'no mask_weights' error, recache with alpha_mask or mask_directory.",
+        )
+
         clean_memory_on_device(accelerator.device)
 
         optimizer_train_fn()  # Set training mode
+
+        # === Prior scheduling / EMA teacher configuration ===
+        prior_decay_schedule = str(getattr(args, "prior_decay_schedule", "constant"))
+        prior_decay_timestep_start = float(getattr(args, "prior_decay_timestep_start", 300.0))
+        prior_decay_warmup_ratio = float(getattr(args, "prior_decay_warmup_ratio", 0.0))
+        prior_schedule_enabled = (prior_decay_schedule != "constant") or (prior_decay_warmup_ratio > 0.0)
+        prior_decay_warmup_steps = int(args.max_train_steps * prior_decay_warmup_ratio) if prior_decay_warmup_ratio > 0 else 0
+
+        prior_teacher_mode = str(getattr(args, "prior_teacher_mode", "base"))
+        prior_teacher_ema_decay = float(getattr(args, "prior_teacher_ema_decay", 0.999))
+        prior_lora_ema: LoRAEmaTeacher | None = None
+        prior_teacher_ema_min_init_steps = 100
+        prior_teacher_ema_init_step = max(prior_teacher_ema_min_init_steps, prior_decay_warmup_steps)
+        if prior_teacher_mode == "ema" and prior_teacher_ema_init_step >= int(args.max_train_steps):
+            logger.warning(
+                "EMA teacher is enabled, but it will not initialize within this run: "
+                f"ema_init_step={prior_teacher_ema_init_step} >= max_train_steps={int(args.max_train_steps)}. "
+                "Teacher will remain in base mode for the entire run."
+            )
 
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch + 1}/{num_train_epochs}")
@@ -2181,6 +2254,16 @@ class NetworkTrainer:
 
             for step, batch in enumerate(train_dataloader):
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
+
+                # Fail-fast validation: ERROR if mask loss enabled but no masks in batch
+                if step == 0:
+                    require_mask_weights_if_enabled(
+                        batch,
+                        args,
+                        cache_hint=(
+                            "Recache with your architecture's cache script and ensure mask_directory is set in dataset config."
+                        ),
+                    )
 
                 latents = batch["latents"]
 
@@ -2201,18 +2284,144 @@ class NetworkTrainer:
                         args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype
                     )
 
+                    # Compute prior prediction if prior preservation is enabled
+                    prior_pred = None
+                    prior_preservation_weight = getattr(args, "prior_preservation_weight", 0.0)
+                    mask_weights = batch.get("mask_weights")
+
+                    need_prior_base = (
+                        prior_preservation_weight > 0 and getattr(args, "use_mask_loss", False) and mask_weights is not None
+                    )
+
+                    # Timestep-adaptive prior weight scheduling (per-sample)
+                    prior_weight_per_sample = None
+                    if need_prior_base and prior_schedule_enabled:
+                        prior_weight_per_sample = compute_prior_weight_per_sample(
+                            timesteps,
+                            base_weight=float(prior_preservation_weight),
+                            schedule=prior_decay_schedule,
+                            pivot_timestep=prior_decay_timestep_start,
+                            global_step=global_step,
+                            warmup_steps=prior_decay_warmup_steps,
+                        )
+
+                    # Initialize EMA teacher once warmup completes
+                    if (
+                        need_prior_base
+                        and prior_teacher_mode == "ema"
+                        and prior_lora_ema is None
+                        and global_step >= prior_teacher_ema_init_step
+                    ):
+                        prior_lora_ema = LoRAEmaTeacher(decay=prior_teacher_ema_decay)
+                        prior_lora_ema.init_from(accelerator.unwrap_model(network))
+
+                    # Determine per-sample whether to run teacher forward pass
+                    prior_timestep_threshold = getattr(args, "prior_preservation_timestep_threshold", None)
+                    prior_sample_mask = None
+                    need_prior = need_prior_base
+                    if need_prior and (prior_timestep_threshold is not None or prior_weight_per_sample is not None):
+                        if prior_timestep_threshold is not None:
+                            do_prior = timesteps > float(prior_timestep_threshold)
+                        else:
+                            do_prior = torch.ones_like(timesteps, dtype=torch.bool)
+
+                        if prior_weight_per_sample is not None:
+                            do_prior = do_prior & (prior_weight_per_sample > 0)
+
+                        # Skip teacher forward if prior region would be empty for all samples
+                        if mask_weights is not None:
+                            if mask_weights.ndim == 5:
+                                mask_min_per_sample = mask_weights.amin(dim=(1, 2, 3, 4))
+                            elif mask_weights.ndim == 4:
+                                mask_min_per_sample = mask_weights.amin(dim=(1, 2, 3))
+                            else:
+                                mask_min_per_sample = mask_weights.view(mask_weights.shape[0], -1).amin(dim=1)
+                        else:
+                            mask_min_per_sample = None
+
+                        prior_mask_threshold = getattr(args, "prior_mask_threshold", None)
+                        if mask_min_per_sample is not None:
+                            if prior_mask_threshold is not None:
+                                has_prior_region = mask_min_per_sample < float(prior_mask_threshold)
+                            else:
+                                has_prior_region = mask_min_per_sample < (1.0 - 1e-6)
+                            has_prior_region = has_prior_region.to(device=do_prior.device)
+                            do_prior = do_prior & has_prior_region
+
+                        prior_sample_mask = do_prior
+                        need_prior = bool(do_prior.any().item())
+                    elif need_prior:
+                        mask_min = float(mask_weights.min())
+                        prior_mask_threshold = getattr(args, "prior_mask_threshold", None)
+                        if prior_mask_threshold is not None:
+                            if mask_min >= float(prior_mask_threshold):
+                                need_prior = False
+                        else:
+                            if mask_min >= (1.0 - 1e-6):
+                                need_prior = False
+
+                    if need_prior:
+                        prior_teacher_eval = bool(getattr(args, "prior_teacher_eval", False))
+                        transformer_was_training = transformer.training if prior_teacher_eval else None
+                        if prior_teacher_eval:
+                            transformer.eval()
+                        try:
+                            with torch.no_grad():
+                                unwrapped_network = accelerator.unwrap_model(network)
+                                prior_teacher_uses_ema = prior_teacher_mode == "ema" and prior_lora_ema is not None
+                                prior_context = (
+                                    prior_lora_ema.apply_to(unwrapped_network)
+                                    if prior_teacher_uses_ema
+                                    else self.prior_model_context(unwrapped_network)
+                                )
+                                with prior_context:
+                                    prior_pred_raw, _ = self.call_dit(
+                                        args,
+                                        accelerator,
+                                        transformer,
+                                        latents,
+                                        batch,
+                                        noise,
+                                        noisy_model_input,
+                                        timesteps,
+                                        network_dtype,
+                                    )
+                            prior_pred = prior_pred_raw.detach()
+                        finally:
+                            if prior_teacher_eval and transformer_was_training:
+                                transformer.train()
+
+                    # Compute model prediction (with LoRA enabled)
                     model_pred, target = self.call_dit(
                         args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype
                     )
-                    loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target, reduction="none")
+                    loss = compute_unreduced_target_loss(model_pred.to(network_dtype), target)
 
                     if weighting is not None:
                         loss = loss * weighting
-                    # loss = loss.mean([1, 2, 3])
-                    # # min snr gamma, scale v pred loss like noise pred, v pred like loss, debiased estimation etc.
-                    # loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
 
-                    loss = loss.mean()  # mean loss over all elements in batch
+                    # Compute prior loss if we have a prior prediction
+                    prior_loss_unreduced = None
+                    if prior_pred is not None:
+                        prior_loss_unreduced = compute_unreduced_target_loss(
+                            model_pred.to(network_dtype),
+                            prior_pred.to(network_dtype),
+                        )
+                        if weighting is not None:
+                            prior_loss_unreduced = prior_loss_unreduced * weighting
+
+                    layout = "layered" if getattr(args, "is_layered", False) else "video"
+                    drop_base_frame = bool(getattr(args, "remove_first_image_from_target", False)) if layout == "layered" else False
+                    loss = apply_masked_loss_with_prior(
+                        loss,
+                        mask_weights,
+                        prior_loss_unreduced=prior_loss_unreduced,
+                        prior_sample_mask=prior_sample_mask,
+                        prior_weight_per_sample=prior_weight_per_sample,
+                        args=args,
+                        layout=layout,
+                        drop_base_frame=drop_base_frame,
+                    )
 
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
@@ -2230,6 +2439,10 @@ class NetworkTrainer:
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+
+                    # EMA teacher update: update once per optimizer step
+                    if accelerator.sync_gradients and prior_lora_ema is not None:
+                        prior_lora_ema.update(accelerator.unwrap_model(network))
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
@@ -3019,6 +3232,9 @@ def setup_parser_common() -> argparse.ArgumentParser:
     parser.add_argument("--dit", type=str, help="DiT checkpoint path / DiTのチェックポイントのパス")
     parser.add_argument("--vae", type=str, help="VAE checkpoint path / VAEのチェックポイントのパス")
     parser.add_argument("--vae_dtype", type=str, default=None, help="data type for VAE, default depends on model")
+
+    # Mask loss arguments
+    add_mask_loss_args(parser)
 
     return parser
 

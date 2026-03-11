@@ -21,6 +21,37 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+def apply_cache_mask_transforms(
+    mask: torch.Tensor,
+    *,
+    cache_mask_gamma: float = 1.0,
+    cache_mask_min_weight: float = 0.0,
+) -> torch.Tensor:
+    """Apply cache-time mask gamma/min_weight in float32, returning a clamped [0,1] tensor."""
+    gamma = float(cache_mask_gamma)
+    min_weight = float(cache_mask_min_weight)
+
+    if gamma <= 0:
+        raise ValueError("--cache_mask_gamma must be > 0")
+    if min_weight < 0 or min_weight >= 1.0:
+        raise ValueError("--cache_mask_min_weight must be in range [0, 1)")
+
+    if not mask.is_floating_point():
+        mask = mask.float()
+    if mask.dtype != torch.float32:
+        mask = mask.to(dtype=torch.float32)
+
+    # Clamp first to prevent NaNs for fractional gamma if any rogue values slip in.
+    mask = mask.clamp(0.0, 1.0)
+
+    if gamma != 1.0:
+        mask = mask**gamma
+    if min_weight > 0.0:
+        mask = mask * (1.0 - min_weight) + min_weight
+
+    return mask.clamp(0.0, 1.0)
+
+
 def show_image(
     image: Union[list[Union[Image.Image, np.ndarray], Union[Image.Image, np.ndarray]]],
     control_image: Optional[Union[np.ndarray, list[np.ndarray]]] = None,

@@ -200,6 +200,13 @@ class ItemInfo:
         # np.ndarray for video, list[np.ndarray] for image with multiple controls
         self.control_content: Optional[Union[np.ndarray, list[np.ndarray]]] = None
 
+        # Mask for mask-weighted loss training (grayscale, 0-255)
+        self.mask_content: Optional[np.ndarray] = None
+
+        # Cache-time mask preprocessing parameters (for metadata transparency)
+        self.cache_mask_gamma: Optional[float] = None
+        self.cache_mask_min_weight: Optional[float] = None
+
         # FramePack architecture specific
         self.fp_latent_window_size: Optional[int] = None
         self.fp_1f_clean_indices: Optional[list[int]] = None  # indices of clean latents for 1f
@@ -345,7 +352,12 @@ def save_latent_cache_flux_2(
     save_latent_cache_common(item_info, sd, arch_full)
 
 
-def save_latent_cache_qwen_image(item_info: ItemInfo, latent: torch.Tensor, control_latent: Optional[list[torch.Tensor]]):
+def save_latent_cache_qwen_image(
+    item_info: ItemInfo,
+    latent: torch.Tensor,
+    control_latent: Optional[list[torch.Tensor]],
+    mask_weights: Optional[torch.Tensor] = None,
+):
     """Qwen-Image architecture"""
     assert latent.dim() == 4, "latent should be 4D tensor (frame, channel, height, width)"
     assert control_latent is None or all(cl.dim() == 4 for cl in control_latent), (
@@ -360,6 +372,10 @@ def save_latent_cache_qwen_image(item_info: ItemInfo, latent: torch.Tensor, cont
         for i, cl in enumerate(control_latent):
             _, F, H, W = cl.shape
             sd[f"latents_control_{i}_{F}x{H}x{W}_{dtype_str}"] = cl.detach().cpu().contiguous()
+
+    if mask_weights is not None:
+        mask_dtype_str = dtype_to_str(torch.float16)
+        sd[f"mask_weights_{F}x{H}x{W}_{mask_dtype_str}"] = mask_weights.detach().to(device="cpu", dtype=torch.float16)
 
     save_latent_cache_common(item_info, sd, ARCHITECTURE_QWEN_IMAGE_FULL)
 
@@ -441,11 +457,24 @@ def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], a
     if item_info.frame_count is not None:
         metadata["frame_count"] = f"{item_info.frame_count}"
 
+    # Record cache-time mask preprocessing parameters for transparency and training-time safety checks.
+    gamma = getattr(item_info, "cache_mask_gamma", None)
+    min_weight = getattr(item_info, "cache_mask_min_weight", None)
+    gamma = 1.0 if gamma is None else float(gamma)
+    min_weight = 0.0 if min_weight is None else float(min_weight)
+    metadata["cache_mask_gamma"] = format(gamma, ".6g")
+    metadata["cache_mask_min_weight"] = format(min_weight, ".6g")
+
     for key, value in sd.items():
+        if not value.is_contiguous():
+            value = value.contiguous()
+            sd[key] = value
+
         # NaN check and show warning, replace NaN with 0
-        if torch.isnan(value).any():
-            logger.warning(f"{key} tensor has NaN: {item_info.item_key}, replace NaN with 0")
-            value[torch.isnan(value)] = 0
+        if value.dtype.is_floating_point or value.dtype.is_complex:
+            if torch.isnan(value).any():
+                logger.warning(f"{key} tensor has NaN: {item_info.item_key}, replace NaN with 0")
+                value[torch.isnan(value)] = 0
 
     latent_dir = os.path.dirname(item_info.latent_cache_path)
     os.makedirs(latent_dir, exist_ok=True)
@@ -920,10 +949,14 @@ class BucketBatchManager:
 
         batch_tensor_data = {}
         varlen_keys = set()
+        mask_weights_per_item = []
+
         for item_info in bucket[start:end]:
             sd_latent = load_file(item_info.latent_cache_path)
             sd_te = load_file(item_info.text_encoder_output_cache_path)
             sd = {**sd_latent, **sd_te}
+
+            item_mask_weights = None
 
             # TODO refactor this
             for key in sd.keys():
@@ -939,6 +972,13 @@ class BucketBatchManager:
                     content_key = content_key.rsplit("_", 1)[0]  # remove dtype
                     if content_key.startswith("latents_"):
                         content_key = content_key.rsplit("_", 1)[0]  # remove FxHxW
+                    elif content_key.startswith("mask_weights_"):
+                        content_key = "mask_weights"
+                        item_mask_weights = sd[key]
+
+                # Skip mask_weights here — handled separately below for proper alignment
+                if content_key == "mask_weights":
+                    continue
 
                 if content_key not in batch_tensor_data:
                     batch_tensor_data[content_key] = []
@@ -947,9 +987,24 @@ class BucketBatchManager:
                 if is_varlen_key:
                     varlen_keys.add(content_key)
 
+            mask_weights_per_item.append(item_mask_weights)
+
         for key in batch_tensor_data.keys():
             if key not in varlen_keys:
                 batch_tensor_data[key] = torch.stack(batch_tensor_data[key])
+
+        # Handle mask_weights with proper batch alignment.
+        # If any item has mask_weights, all items need one (use ones for missing).
+        any_has_mask = any(m is not None for m in mask_weights_per_item)
+        if any_has_mask:
+            template_mask = next(m for m in mask_weights_per_item if m is not None)
+            aligned_masks = []
+            for m in mask_weights_per_item:
+                if m is not None:
+                    aligned_masks.append(m)
+                else:
+                    aligned_masks.append(torch.ones_like(template_mask))
+            batch_tensor_data["mask_weights"] = torch.stack(aligned_masks)
 
         if self.timestep_pool is not None:
             batch_tensor_data["timesteps"] = self.timestep_pool[idx][: end - start]  # use the pre-generated timesteps
@@ -1780,6 +1835,9 @@ class ImageDataset(BaseDataset):
         image_directory: Optional[str] = None,
         image_jsonl_file: Optional[str] = None,
         control_directory: Optional[str] = None,
+        mask_directory: Optional[str] = None,
+        alpha_mask: bool = False,
+        require_mask: bool = False,
         cache_directory: Optional[str] = None,
         multiple_target: bool = False,
         fp_latent_window_size: Optional[int] = 9,
@@ -1805,6 +1863,13 @@ class ImageDataset(BaseDataset):
         self.image_directory = image_directory
         self.image_jsonl_file = image_jsonl_file
         self.control_directory = control_directory
+        self.mask_directory = mask_directory
+        if alpha_mask:
+            raise NotImplementedError(
+                "alpha_mask=True is not yet implemented. Use mask_directory to provide external mask files instead."
+            )
+        self.alpha_mask = alpha_mask
+        self.require_mask = require_mask
         self.multiple_target = multiple_target
         self.fp_latent_window_size = fp_latent_window_size
         self.fp_1f_clean_indices = fp_1f_clean_indices
@@ -1841,6 +1906,35 @@ class ImageDataset(BaseDataset):
 
         if self.cache_directory is None:
             self.cache_directory = self.image_directory
+
+        # Set up mask paths if mask_directory is specified (O(1) lookup by basename)
+        self.mask_paths: Optional[dict[str, str]] = None
+        if mask_directory is not None:
+            logger.info(f"glob mask images in {mask_directory}")
+            all_mask_paths = glob_images(mask_directory)
+            logger.info(f"found {len(all_mask_paths)} mask images")
+
+            mask_by_basename: dict[str, str] = {}
+            for mask_path in all_mask_paths:
+                basename_no_ext = os.path.splitext(os.path.basename(mask_path))[0]
+                if basename_no_ext not in mask_by_basename:
+                    mask_by_basename[basename_no_ext] = mask_path
+
+            self.mask_paths = {}
+            image_paths = self.datasource.image_paths if hasattr(self.datasource, "image_paths") else []
+            for image_path in image_paths:
+                image_basename_no_ext = os.path.splitext(os.path.basename(image_path))[0]
+                if image_basename_no_ext in mask_by_basename:
+                    self.mask_paths[image_path] = mask_by_basename[image_basename_no_ext]
+
+            logger.info(f"matched {len(self.mask_paths)} masks to images")
+            if len(self.mask_paths) < len(image_paths) and not self.alpha_mask:
+                logger.warning(f"{len(image_paths) - len(self.mask_paths)} images have no matching mask file")
+
+        if self.require_mask and not self.alpha_mask and self.mask_paths is None:
+            raise ValueError(
+                "require_mask=true but no mask source configured. Set alpha_mask=true and/or mask_directory in your dataset config."
+            )
 
         self.batch_manager = None
         self.num_train_items = 0
@@ -1879,7 +1973,7 @@ class ImageDataset(BaseDataset):
                         break  # submit batch if possible
 
                 for future in completed_futures:
-                    original_size, item_key, images, caption, controls = future.result()
+                    original_size, item_key, images, caption, controls, mask = future.result()
                     image = images[0]  # use the first image as the main content
                     bucket_height, bucket_width = image.shape[:2]
                     bucket_reso = (bucket_width, bucket_height)
@@ -1888,6 +1982,10 @@ class ImageDataset(BaseDataset):
                         item_key, caption, original_size, bucket_reso, content=image if len(images) == 1 else images
                     )
                     item_info.latent_cache_path = self.get_latent_cache_path(item_info)
+
+                    # Store mask content for mask-weighted loss training
+                    if mask is not None:
+                        item_info.mask_content = mask
 
                     # for VLM, which require image in addition to text, like Qwen-Image-Edit
                     item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
@@ -1976,7 +2074,16 @@ class ImageDataset(BaseDataset):
                             resized_control = resize_image_to_bucket(control, bucket_reso)
                             resized_controls.append(resized_control)
 
-                return image_size, image_key, images, caption, resized_controls
+                # Load mask if available
+                resized_mask = None
+                if self.mask_paths is not None and image_key in self.mask_paths:
+                    from PIL import Image as PILImage
+                    mask = PILImage.open(self.mask_paths[image_key]).convert("L")
+                    resized_mask = resize_image_to_bucket(mask, bucket_reso)
+                    if resized_mask.ndim == 3:
+                        resized_mask = resized_mask[:, :, 0]  # grayscale: take first channel
+
+                return image_size, image_key, images, caption, resized_controls, resized_mask
 
             future = executor.submit(fetch_and_resize, fetch_op)
             futures.append(future)
