@@ -10,12 +10,14 @@ import logging
 from typing import List
 
 import torch
+import torch.nn.functional as Fnn
 
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.image_video_dataset import ItemInfo, ARCHITECTURE_Z_IMAGE, save_latent_cache_z_image
 from musubi_tuner.zimage import zimage_autoencoder
 from musubi_tuner.zimage.zimage_autoencoder import AutoencoderKL
+from musubi_tuner.zimage.zimage_config import ZIMAGE_VAE_SCALE_FACTOR
 import musubi_tuner.cache_latents as cache_latents
 
 logger = logging.getLogger(__name__)
@@ -77,9 +79,49 @@ def encode_and_save_batch(vae: AutoencoderKL, batch: List[ItemInfo]):
     for b, item in enumerate(batch):
         latent = latents[b]  # C, H, W
 
-        logger.debug(f"Saving cache for item {item.item_key} at {item.latent_cache_path}. Latent shape: {latent.shape}")
+        # Process mask if available (for mask-weighted loss training)
+        mask_weights_i = None
+        if item.mask_content is not None:
+            mask_np = item.mask_content  # (H, W) grayscale 0-255
 
-        save_latent_cache_z_image(item_info=item, latent=latent)
+            if mask_np.sum() == 0:
+                logger.warning(
+                    f"All-zero mask for '{item.item_key}' — this item will contribute zero training signal."
+                )
+
+            # Validate aspect ratio matching
+            mask_h, mask_w = mask_np.shape[:2]
+            img_h = latent.shape[1] * ZIMAGE_VAE_SCALE_FACTOR
+            img_w = latent.shape[2] * ZIMAGE_VAE_SCALE_FACTOR
+            if img_h > 0 and img_w > 0 and mask_h > 0 and mask_w > 0:
+                img_ar = img_w / img_h
+                mask_ar = mask_w / mask_h
+                if abs(img_ar - mask_ar) / max(img_ar, mask_ar) > 0.10:
+                    logger.warning(
+                        f"Mask aspect ratio ({mask_w}x{mask_h}, AR={mask_ar:.2f}) differs >10% from target "
+                        f"({img_w}x{img_h}, AR={img_ar:.2f}) for '{item.item_key}'."
+                    )
+
+            mask = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+            mask = (mask.float() / 255.0).clamp_(0.0, 1.0)
+            mask = cache_latents.apply_cache_mask_transforms(
+                mask,
+                cache_mask_gamma=float(getattr(item, "cache_mask_gamma", 1.0) or 1.0),
+                cache_mask_min_weight=float(getattr(item, "cache_mask_min_weight", 0.0) or 0.0),
+            )
+
+            # Downsample to latent space using area interpolation
+            lat_h, lat_w = latent.shape[1], latent.shape[2]
+            mask = Fnn.interpolate(mask, size=(lat_h, lat_w), mode="area")  # (1, 1, lat_h, lat_w)
+            mask_weights_i = mask
+
+        logger.debug(
+            f"Saving cache for item {item.item_key} at {item.latent_cache_path}. "
+            f"Latent shape: {latent.shape}, "
+            f"mask weights shape: {mask_weights_i.shape if mask_weights_i is not None else None}"
+        )
+
+        save_latent_cache_z_image(item_info=item, latent=latent, mask_weights=mask_weights_i)
 
 
 def main():

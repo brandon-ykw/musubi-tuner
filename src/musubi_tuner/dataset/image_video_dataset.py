@@ -435,7 +435,9 @@ def save_latent_cache_hunyuan_video_1_5(
     save_latent_cache_common(item_info, sd, ARCHITECTURE_HUNYUAN_VIDEO_1_5_FULL)
 
 
-def save_latent_cache_z_image(item_info: ItemInfo, latent: torch.Tensor):
+def save_latent_cache_z_image(
+    item_info: ItemInfo, latent: torch.Tensor, mask_weights: Optional[torch.Tensor] = None
+):
     """Z-Image architecture. No control latent is supported."""
     assert latent.dim() == 3, "latent should be 3D tensor (channel, height, width)"
 
@@ -443,6 +445,10 @@ def save_latent_cache_z_image(item_info: ItemInfo, latent: torch.Tensor):
     F = 1
     dtype_str = dtype_to_str(latent.dtype)
     sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
+
+    if mask_weights is not None:
+        mask_dtype_str = dtype_to_str(torch.float16)
+        sd[f"mask_weights_{F}x{H}x{W}_{mask_dtype_str}"] = mask_weights.detach().to(device="cpu", dtype=torch.float16)
 
     save_latent_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
 
